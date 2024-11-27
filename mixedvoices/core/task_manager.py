@@ -7,8 +7,11 @@ from dataclasses import dataclass
 from enum import Enum
 from queue import Empty, Queue
 from typing import Any, Dict, Optional
+from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
 
 import mixedvoices.constants as constants
+from mixedvoices.utils import process_recording
 
 
 class TaskStatus(Enum):
@@ -54,7 +57,7 @@ class TaskManager:
                     cls._instance = super(TaskManager, cls).__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, num_processes=4):
         if self._initialized:
             return
 
@@ -69,6 +72,9 @@ class TaskManager:
         self._load_pending_tasks()
         self._start_processing_thread()
         self._start_monitor_thread()
+        self.process_pool = Pool(processes=num_processes)
+        self.thread_pool = ThreadPoolExecutor(max_workers=num_processes)
+        self.active_futures = set()
 
     def _monitor_status(self):
         main_thread = threading.main_thread()
@@ -191,14 +197,19 @@ class TaskManager:
             )
             self.processing_thread.start()
 
+    def _process_recording_task(self, task_params):
+        """Helper function to process a single recording in a separate process"""
+        return process_recording(**task_params)
+
     def _process_queue(self):
         main_thread = threading.main_thread()
 
         while True:
             if (
-                not main_thread.is_alive()
-                and self.task_queue.empty()
-                and not self.is_processing
+                    not main_thread.is_alive()
+                    and self.task_queue.empty()
+                    and not self.is_processing
+                    and len(self.active_futures) == 0
             ):
                 break
 
@@ -208,6 +219,8 @@ class TaskManager:
                     self.is_processing = True
                 except Empty:
                     self.is_processing = False
+                    # Clean up completed futures
+                    self.active_futures = {f for f in self.active_futures if not f.done()}
                     continue
 
                 task = self.tasks.get(task_id)
@@ -222,26 +235,48 @@ class TaskManager:
                     self._save_task(task)
 
                     if task.task_type == "process_recording":
-                        from mixedvoices.utils import process_recording
-
                         deserialized_params = self._deserialize_task_params(
                             task.task_type, task.params
                         )
-                        process_recording(**deserialized_params)
-                        task.status = TaskStatus.COMPLETED
-                        task.completed_at = time.time()
+
+                        # Submit the task to the process pool
+                        future = self.thread_pool.submit(
+                            self.process_pool.apply_async,
+                            self._process_recording_task,
+                            (deserialized_params,)
+                        )
+
+                        # Add callback to handle completion
+                        def task_done_callback(fut, task=task):
+                            try:
+                                result = fut.result().get()  # Get result from AsyncResult
+                                task.status = TaskStatus.COMPLETED
+                                task.completed_at = time.time()
+                            except Exception as e:
+                                task.status = TaskStatus.FAILED
+                                task.error = str(e)
+                                logging.error(f"Task {task.task_id} failed: {str(e)}")
+                            finally:
+                                self._save_task(task)
+                                self.task_queue.task_done()
+
+                        future.add_done_callback(task_done_callback)
+                        self.active_futures.add(future)
+                        self.is_processing = False
+                        continue
+
                 except Exception as e:
                     task.status = TaskStatus.FAILED
                     task.error = str(e)
                     logging.error(f"Task {task_id} failed: {str(e)}")
                 finally:
-                    self._save_task(task)
-                    self.task_queue.task_done()
+                    if task.task_type != "process_recording":
+                        self._save_task(task)
+                        self.task_queue.task_done()
                     self.is_processing = False
 
-            except Exception:
-                if "task_id" in locals():
-                    self.task_queue.task_done()
+            except Exception as e:
+                logging.error(f"Error in process queue: {str(e)}")
                 self.is_processing = False
 
     def add_task(self, task_type: str, **params) -> str:
